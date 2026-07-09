@@ -1,0 +1,20 @@
+# Environment & secrets — NEVER commit these
+.env
+
+# Python virtual environment
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Local data (vector store, uploaded files, registry)
+data/knowledge_base/
+data/tmp/
+data/docs_registry.json
+
+# macOS system files
+.DS_Store
+
+# Editor files
+.vscode/
+.idea/
