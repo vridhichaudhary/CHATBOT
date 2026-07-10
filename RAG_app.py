@@ -43,7 +43,7 @@ try:
     GOOGLE_API_KEY = _st.secrets["GOOGLE_API_KEY"]
 except Exception:
     GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
-GEMINI_MODEL    = "gemini-2.5-flash"
+GEMINI_MODEL    = "gemini-2.0-flash"
 EMBEDDING_MODEL = "models/gemini-embedding-2"
 
 WELCOME_MSG     = "Hello! How can I help you today? Ask me anything about your documents."
@@ -195,6 +195,21 @@ def get_history_text(history: ChatMessageHistory) -> str:
     return "\n".join(lines)
 
 
+def _invoke_with_retry(llm, prompt, max_retries=3):
+    """Call LLM with auto-retry on rate limit (429) errors."""
+    import time
+    for attempt in range(max_retries):
+        try:
+            return llm.invoke(prompt)
+        except Exception as e:
+            if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
+                wait = 15 * (attempt + 1)  # 15s, 30s, 45s
+                time.sleep(wait)
+            else:
+                raise e
+    raise Exception(f"Model quota exceeded after {max_retries} retries. Please wait a minute and try again.")
+
+
 def answer_question(question: str, history: ChatMessageHistory) -> tuple[str, list]:
     """Condense question → retrieve docs → answer. Returns (answer, source_docs)."""
     llm = ChatGoogleGenerativeAI(
@@ -212,7 +227,8 @@ def answer_question(question: str, history: ChatMessageHistory) -> tuple[str, li
 
     # Step 1 — condense to standalone question
     if history_text:
-        standalone = condense_llm.invoke(
+        standalone = _invoke_with_retry(
+            condense_llm,
             CONDENSE_PROMPT.format(history=history_text, question=question)
         ).content.strip()
     else:
@@ -225,7 +241,8 @@ def answer_question(question: str, history: ChatMessageHistory) -> tuple[str, li
     context = "\n\n".join(d.page_content for d in docs)
 
     # Step 3 — generate answer
-    answer = llm.invoke(
+    answer = _invoke_with_retry(
+        llm,
         ANSWER_PROMPT.format(
             context=context,
             history=history_text,
