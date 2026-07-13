@@ -308,7 +308,7 @@ def render_sidebar():
         st.markdown("### Add Documents")
         uploaded = st.file_uploader(
             "Upload a file",
-            type=["pdf", "txt", "csv", "docx", "html", "xlsx"],
+            type=["pdf", "txt", "csv", "docx", "html", "htm", "xlsx"],
             accept_multiple_files=True,
             label_visibility="collapsed"
         )
