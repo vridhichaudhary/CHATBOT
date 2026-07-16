@@ -110,7 +110,7 @@ def _df_to_rows(df: pd.DataFrame, default_date: str | None, default_shift: str |
     
     rows = []
     for _, row in df.iterrows():
-        sample = _clean(row[sample_col_name])
+        sample = _clean(row.iloc[sample_col_idx])
         if not sample:
             continue
 
@@ -119,16 +119,16 @@ def _df_to_rows(df: pd.DataFrame, default_date: str | None, default_shift: str |
         r_shift = default_shift
         
         if date_col_idx != -1:
-            r_date = _format_date(_clean(row[df.columns[date_col_idx]]) or "", default_date)
+            r_date = _format_date(_clean(row.iloc[date_col_idx]) or "", default_date)
         if shift_col_idx != -1:
-            r_shift = _format_shift(_clean(row[df.columns[shift_col_idx]]) or "", default_shift)
+            r_shift = _format_shift(_clean(row.iloc[shift_col_idx]) or "", default_shift)
 
         # Iterate over all other columns (parameters)
         for i, col_name in enumerate(df.columns):
             if i in (sample_col_idx, date_col_idx, shift_col_idx):
                 continue
                 
-            val = _clean(row[col_name])
+            val = _clean(row.iloc[i])
             if val is None:
                 continue
                 
