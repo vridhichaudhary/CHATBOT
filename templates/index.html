@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>IOCL Lab Assistant</title>
+  <meta name="description" content="IOCL Internal Laboratory Results Assistant"/>
+  <link rel="preconnect" href="https://fonts.googleapis.com"/>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet"/>
+  <link rel="stylesheet" href="/static/css/style.css"/>
+</head>
+<body>
+
+<!-- ═══════════════════════════════════════════
+     SIDEBAR
+═══════════════════════════════════════════ -->
+<aside class="sidebar">
+  <div class="sidebar-logo">
+    <div class="logo-icon">🔬</div>
+    <div class="logo-text">
+      <span class="logo-title">IOCL</span>
+      <span class="logo-sub">Lab Assistant</span>
+    </div>
+  </div>
+
+  <nav class="sidebar-nav">
+    <a class="nav-item active" data-page="dashboard" href="#">
+      <span class="nav-icon">📊</span> Dashboard
+    </a>
+    <a class="nav-item" data-page="upload" href="#">
+      <span class="nav-icon">📤</span> Upload Reports
+    </a>
+    <a class="nav-item" data-page="chat" href="#">
+      <span class="nav-icon">💬</span> Chat
+    </a>
+    <a class="nav-item" data-page="history" href="#">
+      <span class="nav-icon">📜</span> Search History
+    </a>
+  </nav>
+
+  <div class="sidebar-footer">
+    <div class="status-dot" id="api-dot"></div>
+    <span class="status-label" id="api-label">Checking…</span>
+  </div>
+</aside>
+
+<!-- ═══════════════════════════════════════════
+     MAIN CONTENT
+═══════════════════════════════════════════ -->
+<main class="main">
+
+  <!-- ─── DASHBOARD ─── -->
+  <div id="page-dashboard" class="page active">
+    <div class="page-header">
+      <h1 id="dash-greeting">Dashboard</h1>
+      <p>Overview of all uploaded laboratory reports.</p>
+    </div>
+    <div class="page-body">
+      <div class="stats-grid">
+        <div class="stat-card">
+          <div class="stat-label">Total Reports</div>
+          <div class="stat-value" id="stat-reports">—</div>
+          <div class="stat-sub">uploaded files</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Data Records</div>
+          <div class="stat-value" id="stat-records">—</div>
+          <div class="stat-sub">parameter values stored</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Morning Shifts</div>
+          <div class="stat-value" id="stat-morning">—</div>
+          <div class="stat-sub">reports</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Evening Shifts</div>
+          <div class="stat-value" id="stat-evening">—</div>
+          <div class="stat-sub">reports</div>
+        </div>
+      </div>
+
+      <div class="section-title">Recent Reports</div>
+      <div class="reports-table" id="reports-table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>File Name</th>
+              <th>Report Date</th>
+              <th>Shift</th>
+              <th>Records</th>
+              <th>Uploaded By</th>
+              <th>Expires</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody id="reports-tbody">
+            <tr><td colspan="7"><div class="empty-state"><div class="empty-icon">📂</div><p>No reports yet. Upload one to get started.</p></div></td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- ─── UPLOAD ─── -->
+  <div id="page-upload" class="page">
+    <div class="page-header">
+      <h1>Upload Report</h1>
+      <p>Upload a laboratory result file. Date and shift are automatically detected from the document.</p>
+    </div>
+    <div class="page-body">
+      <div class="upload-layout">
+        <!-- Drop Zone -->
+        <div>
+          <div class="dropzone" id="dropzone">
+            <input type="file" id="file-input" accept=".html,.htm,.xlsx,.xls,.csv,.pdf" hidden/>
+            <div class="dropzone-icon">📁</div>
+            <div class="dropzone-title">Drop your file here, or click to browse</div>
+            <div class="dropzone-sub">Shift and date are extracted automatically from the document</div>
+            <div class="dropzone-formats">
+              <span class="format-tag">HTML</span>
+              <span class="format-tag">HTM</span>
+              <span class="format-tag">XLSX</span>
+              <span class="format-tag">XLS</span>
+              <span class="format-tag">CSV</span>
+              <span class="format-tag">PDF</span>
+            </div>
+          </div>
+
+          <div class="file-selected" id="file-selected">
+            <span>📄</span>
+            <span class="file-selected-name" id="file-selected-name">—</span>
+            <span class="file-selected-size" id="file-selected-size">—</span>
+          </div>
+
+          <div class="upload-result" id="upload-result">
+            <div class="upload-result-title" id="upload-result-title"></div>
+            <div class="upload-result-detail" id="upload-result-detail"></div>
+            <div class="upload-meta-row" id="upload-meta-row"></div>
+          </div>
+        </div>
+
+        <!-- Metadata Card -->
+        <div class="upload-meta-card">
+          <h3>Report Details</h3>
+
+          <div class="form-group">
+            <label class="form-label" for="report-date">Report Date</label>
+            <input class="form-input" type="date" id="report-date"/>
+            <p style="font-size:11.5px;color:var(--text-muted);margin-top:5px;">
+              Auto-detected from document. Override if needed.
+            </p>
+          </div>
+
+          <div class="form-group">
+            <label class="form-label" for="uploaded-by">Uploaded By</label>
+            <input class="form-input" type="text" id="uploaded-by"
+                   placeholder="Your name or department"/>
+          </div>
+
+          <button class="btn btn-primary" id="upload-btn" disabled>
+            <span id="upload-btn-text">📥 Upload &amp; Parse</span>
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ─── CHAT ─── -->
+  <div id="page-chat" class="page">
+    <!-- Suggested queries sidebar -->
+    <div class="chat-suggestions">
+      <h3>Suggested Queries</h3>
+      <div class="suggestion-chip" data-q="Show today's Evening shift results">Show today's Evening shift results</div>
+      <div class="suggestion-chip" data-q="Show today's Morning shift results">Show today's Morning shift results</div>
+      <div class="suggestion-chip" data-q="What is the Density of NHT Feed?">What is the Density of NHT Feed?</div>
+      <div class="suggestion-chip" data-q="Give me complete Reformate report">Give me complete Reformate report</div>
+      <div class="suggestion-chip" data-q="Show results for yesterday Evening">Show results for yesterday Evening</div>
+      <div class="suggestion-chip" data-q="What is the PX value?">What is the PX value?</div>
+      <div class="suggestion-chip" data-q="Show DSN complete results">Show DSN complete results</div>
+      <div class="suggestion-chip" data-q="Give me all samples from today">Give me all samples from today</div>
+    </div>
+
+    <!-- Chat main area -->
+    <div class="chat-main">
+      <div class="chat-header">
+        <h2>Lab Data Chat</h2>
+        <p>Ask questions in natural language — answers come only from uploaded reports.</p>
+      </div>
+
+      <div class="chat-messages" id="chat-messages">
+        <div class="message assistant">
+          <div class="message-avatar">🔬</div>
+          <div class="message-bubble">
+Hello! I'm your IOCL Lab Assistant. I answer questions only from uploaded laboratory reports.
+
+Try asking me:
+• Show today's Evening shift results
+• What is the Density of NHT Feed?
+• Give me Reformate results for 05-07-2026
+• Show complete DSN report
+          </div>
+        </div>
+      </div>
+
+      <div class="chat-input-bar">
+        <textarea class="chat-input" id="chat-input" rows="1"
+                  placeholder="Ask about lab results…"></textarea>
+        <button class="chat-send-btn" id="chat-send-btn" title="Send">➤</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ─── HISTORY ─── -->
+  <div id="page-history" class="page">
+    <div class="page-header">
+      <h1>Search History</h1>
+      <p>Your past queries during this session.</p>
+    </div>
+    <div class="page-body">
+      <div class="history-search">
+        <input class="form-input" type="text" id="history-search"
+               placeholder="Filter queries…"/>
+        <button class="btn btn-ghost" id="clear-history-btn"
+                style="color:var(--text-muted);white-space:nowrap;">
+          Clear history
+        </button>
+      </div>
+      <div id="history-list">
+        <div class="empty-state">
+          <div class="empty-icon">💬</div>
+          <p>No queries yet. Try the Chat tab.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+
+</main>
+
+<!-- Toast -->
+<div class="toast" id="toast"></div>
+
+<script src="/static/js/app.js"></script>
+</body>
+</html>
