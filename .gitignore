@@ -18,3 +18,5 @@ data/docs_registry.json
 # Editor files
 .vscode/
 .idea/
+data/*.db
+data/uploads/

@@ -27,11 +27,19 @@ lab data is structured and needs exact lookups, not semantic search.
 from __future__ import annotations
 
 import sqlite3
+import os
 from pathlib import Path
+from datetime import datetime, timedelta
 
 from lab_parser import LabRecord, parse_lab_reports
 
 SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS structured_reports (
+    source_file TEXT PRIMARY KEY,
+    upload_date TEXT NOT NULL,
+    expires_at  TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS lab_results (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     material    TEXT NOT NULL,
@@ -41,7 +49,8 @@ CREATE TABLE IF NOT EXISTS lab_results (
     parameter   TEXT NOT NULL,
     unit        TEXT,
     value       TEXT NOT NULL,
-    source_file TEXT NOT NULL
+    source_file TEXT NOT NULL,
+    FOREIGN KEY (source_file) REFERENCES structured_reports(source_file) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_lab_sample ON lab_results(sample);
 CREATE INDEX IF NOT EXISTS idx_lab_date ON lab_results(date);
@@ -52,8 +61,39 @@ CREATE INDEX IF NOT EXISTS idx_lab_shift ON lab_results(shift);
 def init_lab_table(db_path: str | Path) -> None:
     conn = sqlite3.connect(str(db_path))
     try:
+        conn.execute("PRAGMA foreign_keys=ON")
         conn.executescript(SCHEMA_SQL)
         conn.commit()
+    finally:
+        conn.close()
+
+
+def cleanup_structured_reports(db_path: str | Path, uploads_dir: Path | None = None) -> int:
+    """Deletes structured reports older than 7 days from the DB and filesystem."""
+    init_lab_table(db_path)
+    now = datetime.now().isoformat()
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.row_factory = sqlite3.Row
+    
+    try:
+        expired = conn.execute(
+            "SELECT source_file FROM structured_reports WHERE expires_at < ?", (now,)
+        ).fetchall()
+        
+        for row in expired:
+            source_file = row["source_file"]
+            # Delete physical file if uploads_dir provided
+            if uploads_dir:
+                fp = uploads_dir / source_file
+                if fp.exists():
+                    fp.unlink()
+            
+            # Delete from DB (will CASCADE delete from lab_results)
+            conn.execute("DELETE FROM structured_reports WHERE source_file=?", (source_file,))
+        
+        conn.commit()
+        return len(expired)
     finally:
         conn.close()
 
@@ -65,8 +105,22 @@ def load_records_into_db(records: list[LabRecord], db_path: str | Path) -> int:
     """
     init_lab_table(db_path)
     conn = sqlite3.connect(str(db_path))
+    conn.execute("PRAGMA foreign_keys=ON")
     count = 0
+    now = datetime.now()
+    expires_at = (now + timedelta(days=7)).isoformat()
+    
     try:
+        # First ensure all source_files are tracked in structured_reports
+        unique_files = {r.source_file for r in records}
+        for sf in unique_files:
+            conn.execute(
+                "INSERT OR IGNORE INTO structured_reports (source_file, upload_date, expires_at) "
+                "VALUES (?, ?, ?)",
+                (sf, now.isoformat(), expires_at)
+            )
+
+        # Then insert the actual records
         for r in records:
             for param, (unit, value) in r.values.items():
                 conn.execute(

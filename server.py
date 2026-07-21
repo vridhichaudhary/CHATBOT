@@ -25,7 +25,7 @@ from lab_assistant.parsers import parse_file
 from lab_assistant.chat import answer as lab_answer
 
 # ── New structured lab pipeline ───────────────────────────────────────────────
-from lab_ingest import ingest_lab_reports, load_records_from_db, init_lab_table
+from lab_ingest import ingest_lab_reports, load_records_from_db, init_lab_table, cleanup_structured_reports
 from lab_query import query_records, format_records_as_tables
 
 LAB_DB_PATH = Path("data/lab_results_structured.db")
@@ -42,7 +42,8 @@ UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 # Initialise DB and clean expired files on startup
 init_db()
 _cleaned = run_cleanup()
-
+_cleaned_structured = cleanup_structured_reports(LAB_DB_PATH, UPLOADS_DIR)
+_cleaned += _cleaned_structured
 
 # ── Pages ─────────────────────────────────────────────────────────────────────
 
