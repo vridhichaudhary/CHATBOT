@@ -330,3 +330,32 @@ function updateApiStatus(ok) {
 
 /* ═══ Init ════════════════════════════════════════════════════════════════════ */
 checkStatus();
+
+/* ═══ Mobile Sidebar ══════════════════════════════════════════════════════════ */
+const sidebar = $('sidebar');
+const overlay = $('sidebar-overlay');
+const hamburger = $('hamburger-btn');
+
+function toggleSidebar() {
+  if (sidebar && overlay) {
+    sidebar.classList.toggle('open');
+    overlay.classList.toggle('show');
+  }
+}
+
+if (hamburger) {
+  hamburger.addEventListener('click', toggleSidebar);
+}
+if (overlay) {
+  overlay.addEventListener('click', toggleSidebar);
+}
+
+// Close sidebar when a nav item is clicked on mobile
+document.querySelectorAll('.nav-item').forEach(item => {
+  item.addEventListener('click', () => {
+    if (window.innerWidth <= 768 && sidebar && overlay) {
+      sidebar.classList.remove('open');
+      overlay.classList.remove('show');
+    }
+  });
+});
