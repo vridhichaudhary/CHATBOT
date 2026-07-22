@@ -34,6 +34,9 @@
     <a class="nav-item" data-page="upload" href="#">
       <span class="nav-icon"><i data-feather="upload-cloud"></i></span> Upload Reports
     </a>
+    <a class="nav-item" data-page="reports" href="#">
+      <span class="nav-icon"><i data-feather="database"></i></span> Available Reports
+    </a>
     <a class="nav-item" data-page="history" href="#">
       <span class="nav-icon"><i data-feather="clock"></i></span> History
     </a>
@@ -141,6 +144,22 @@
           <button class="btn btn-primary" id="upload-btn" disabled>
             <span id="upload-btn-text"><i data-feather="database"></i> Parse to DB</span>
           </button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ─── AVAILABLE REPORTS ─── -->
+  <div id="page-reports" class="page">
+    <div class="page-header">
+      <h1>Available Reports</h1>
+      <p>All uploaded lab reports currently stored. Each expires automatically after 7 days.</p>
+    </div>
+    <div class="page-body">
+      <div id="reports-list">
+        <div class="empty-state">
+          <div class="empty-icon"><i data-feather="loader"></i></div>
+          <p>Loading reports…</p>
         </div>
       </div>
     </div>

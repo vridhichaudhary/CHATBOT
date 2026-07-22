@@ -359,3 +359,62 @@ document.querySelectorAll('.nav-item').forEach(item => {
     }
   });
 });
+
+/* ═══ Available Reports Panel ══════════════════════════════════════════════════ */
+async function loadStructuredReports() {
+  const el = $('reports-list');
+  if (!el) return;
+  try {
+    const res  = await fetch('/api/structured-reports');
+    const data = await res.json();
+    if (!data.length) {
+      el.innerHTML = `<div class="empty-state"><div class="empty-icon"><i data-feather="inbox"></i></div><p>No reports uploaded yet. Go to <strong>Upload Reports</strong> to add one.</p></div>`;
+      feather.replace(); return;
+    }
+    el.innerHTML = `
+      <div class="reports-table">
+        <table>
+          <thead>
+            <tr>
+              <th>File</th>
+              <th>Dates in Report</th>
+              <th>Shifts</th>
+              <th>Records</th>
+              <th>Uploaded</th>
+              <th>Expires In</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${data.map(r => {
+              const uploaded  = new Date(r.upload_date);
+              const expires   = new Date(r.expires_at);
+              const now       = new Date();
+              const daysLeft  = Math.ceil((expires - now) / 86400000);
+              const expClass  = daysLeft <= 2 ? 'color:var(--error)' : daysLeft <= 4 ? 'color:var(--warning)' : 'color:var(--success)';
+              const dateRange = r.earliest_date && r.latest_date && r.earliest_date !== r.latest_date
+                ? `${r.earliest_date} → ${r.latest_date}`
+                : (r.earliest_date || '—');
+              return `<tr>
+                <td style="font-weight:500;word-break:break-all;">${escapeHtml(r.source_file)}</td>
+                <td>${escapeHtml(dateRange)}</td>
+                <td>${escapeHtml(r.shifts || '—')}</td>
+                <td>${r.record_count ?? '—'}</td>
+                <td>${uploaded.toLocaleDateString('en-GB', {day:'2-digit',month:'short',year:'numeric'})}</td>
+                <td style="${expClass};font-weight:600;">${daysLeft > 0 ? daysLeft + 'd' : 'Expired'}</td>
+              </tr>`;
+            }).join('')}
+          </tbody>
+        </table>
+      </div>`;
+    feather.replace();
+  } catch (e) {
+    el.innerHTML = `<div class="empty-state"><p>Failed to load reports.</p></div>`;
+  }
+}
+
+// Patch navigate to load reports when switching to reports tab
+const _origNavigate = navigate;
+window.navigate = function(page) {
+  _origNavigate(page);
+  if (page === 'reports') loadStructuredReports();
+};

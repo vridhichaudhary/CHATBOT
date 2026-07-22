@@ -2,9 +2,11 @@
 server.py — Flask backend for the IOCL Laboratory Results Assistant.
 Serves the HTML frontend and exposes REST API endpoints.
 
-Ingestion paths:
-  • .htm/.html  → lab_parser (structured nobr-cell extraction) → lab_ingest (SQLite)
-  • other types → lab_assistant.parsers (generic pandas-based) → lab_assistant.db
+Storage strategy (cloud-persistent):
+  • .htm/.html  → lab_parser (structured nobr-cell extraction)
+                → lab_ingest  (PostgreSQL + Supabase Storage)
+  • other types → lab_assistant.parsers (generic pandas-based)
+                → lab_assistant.db (PostgreSQL)
 
 Query routing:
   1. lab_query (exact structured lookup, zero LLM tokens) — if a known sample matches
@@ -23,27 +25,33 @@ from lab_assistant.db import (init_db, run_cleanup, get_all_reports,
                                insert_lab_results, get_conn)
 from lab_assistant.parsers import parse_file
 from lab_assistant.chat import answer as lab_answer
+from supabase import create_client
 
 # ── New structured lab pipeline ───────────────────────────────────────────────
-from lab_ingest import ingest_lab_reports, load_records_from_db, init_lab_table, cleanup_structured_reports
+from lab_ingest import (ingest_lab_reports, load_records_from_db, init_lab_table,
+                        cleanup_structured_reports, get_all_structured_reports)
 from lab_query import query_records, format_records_as_tables
 
-LAB_DB_PATH = Path("data/lab_results_structured.db")
-LAB_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-init_lab_table(LAB_DB_PATH)
+SUPABASE_URL   = os.getenv("SUPABASE_URL", "")
+SUPABASE_KEY   = os.getenv("SUPABASE_KEY", "")
+STORAGE_BUCKET = "lab-reports"
+
+init_lab_table()
 
 app = Flask(__name__, template_folder="templates", static_folder="static")
 
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
-MODEL_WATERFALL = ["gemini-3.1-flash-lite", "gemini-flash-lite-latest"]
-UPLOADS_DIR = Path("data/uploads")
-UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+MODEL_WATERFALL = ["gemini-2.0-flash", "gemini-1.5-flash"]
 
 # Initialise DB and clean expired files on startup
 init_db()
-_cleaned = run_cleanup()
-_cleaned_structured = cleanup_structured_reports(LAB_DB_PATH, UPLOADS_DIR)
-_cleaned += _cleaned_structured
+_cleaned  = run_cleanup()
+_cleaned += cleanup_structured_reports()
+
+
+def _supabase():
+    return create_client(SUPABASE_URL, SUPABASE_KEY)
+
 
 # ── Pages ─────────────────────────────────────────────────────────────────────
 
@@ -56,15 +64,16 @@ def index():
 
 @app.route("/api/stats")
 def api_stats():
-    reports = get_all_reports()
+    reports      = get_all_reports()
     total_records = sum(r.get("result_count", 0) for r in reports)
     morning = sum(1 for r in reports if r.get("shift") == "M")
     evening = sum(1 for r in reports if r.get("shift") == "E")
 
     conn = get_conn()
-    samples = conn.execute(
-        "SELECT COUNT(DISTINCT sample_name) FROM lab_results"
-    ).fetchone()[0]
+    cur  = conn.cursor()
+    cur.execute("SELECT COUNT(DISTINCT sample_name) FROM lab_results")
+    samples = cur.fetchone()[0]
+    cur.close()
     conn.close()
 
     return jsonify({
@@ -89,39 +98,53 @@ def api_delete_report(report_id):
     return jsonify({"success": True})
 
 
+@app.route("/api/structured-reports")
+def api_structured_reports():
+    """Returns all stored HTM lab reports with date ranges and expiry info."""
+    return jsonify(get_all_structured_reports())
+
+
 @app.route("/api/upload", methods=["POST"])
 def api_upload():
-    file = request.files.get("file")
+    file            = request.files.get("file")
     report_date_str = request.form.get("report_date", str(date.today()))
     uploaded_by     = request.form.get("uploaded_by", "Unknown").strip() or "Unknown"
 
     if not file or not file.filename:
         return jsonify({"error": "No file provided"}), 400
 
-    ext = Path(file.filename).suffix.lower()
+    ext        = Path(file.filename).suffix.lower()
+    file_bytes = file.read()
 
     # ── HTM / HTML → new structured parser ───────────────────────────────────
     if ext in (".htm", ".html"):
+        import tempfile, io
         try:
-            import tempfile, os as _os
-            file_bytes = file.read()
             safe_name = "".join(c if c.isalnum() or c in "._-" else "_"
                                 for c in file.filename)
-            tmp_path = UPLOADS_DIR / safe_name
-            tmp_path.write_bytes(file_bytes)
 
-            summary = ingest_lab_reports([tmp_path], LAB_DB_PATH)
-            num_rows  = summary["num_rows_parsed"]
-            num_vals  = summary["num_parameter_values_inserted"]
-            shifts    = list({r.shift for r in load_records_from_db(LAB_DB_PATH)
-                              if r.source_file == safe_name}) or ["M/E/N"]
-            dates     = summary["date_range"]
+            # Write to a temp file so lab_parser can read it (it expects a path)
+            with tempfile.NamedTemporaryFile(suffix=".htm", delete=False) as tmp:
+                tmp.write(file_bytes)
+                tmp_path = Path(tmp.name)
+
+            # Pass temp path + raw bytes so ingest can upload to Supabase Storage
+            summary  = ingest_lab_reports([tmp_path], file_bytes=file_bytes)
+            tmp_path.unlink(missing_ok=True)   # clean up temp
+
+            num_rows = summary["num_rows_parsed"]
+            num_vals = summary["num_parameter_values_inserted"]
 
             if num_rows == 0:
                 return jsonify({
                     "error": "No data rows extracted. "
                              "Please verify this is a valid PX/PTA lab report."
                 }), 400
+
+            all_records = load_records_from_db()
+            shifts = list({r.shift for r in all_records
+                           if r.source_file == safe_name}) or ["M/E/N"]
+            dates  = summary["date_range"]
 
             return jsonify({
                 "success":           True,
@@ -139,7 +162,6 @@ def api_upload():
 
     # ── Other types → generic pandas parser → lab_assistant DB ───────────────
     try:
-        file_bytes = file.read()
         rows, meta = parse_file(file_bytes, file.filename)
     except Exception as e:
         return jsonify({"error": f"Failed to parse file: {e}"}), 500
@@ -153,17 +175,28 @@ def api_upload():
                      "Please verify the file contains a data table."
         }), 400
 
-    safe_name = "".join(c if c.isalnum() or c in "._-" else "_"
-                        for c in file.filename)
-    file_path = UPLOADS_DIR / f"{report_date}_{shift}_{safe_name}"
-    file_path.write_bytes(file_bytes)
+    # Upload to Supabase Storage
+    safe_name    = "".join(c if c.isalnum() or c in "._-" else "_"
+                           for c in file.filename)
+    storage_path = f"{report_date}_{shift}_{safe_name}"
+    try:
+        sb = _supabase()
+        sb.storage.from_(STORAGE_BUCKET).upload(
+            path=storage_path,
+            file=file_bytes,
+            file_options={"upsert": "true"},
+        )
+    except Exception as e:
+        print(f"[warn] Storage upload failed: {e}")
+        storage_path = ""
 
     report_id = insert_report(
         report_date=report_date,
         shift=shift,
         uploaded_by=uploaded_by,
         original_file_name=file.filename,
-        file_path=str(file_path),
+        file_path=storage_path,
+        storage_path=storage_path,
     )
     insert_lab_results(report_id, rows)
 
@@ -188,10 +221,8 @@ def api_chat():
         return jsonify({"error": "No question provided"}), 400
 
     # ── Route 1: Structured lab_query (zero LLM, exact precision) ────────────
-    # Load all structured records from the HTM parser DB and check if
-    # the question mentions any known sample name.
     try:
-        lab_records = load_records_from_db(LAB_DB_PATH)
+        lab_records = load_records_from_db()
         if lab_records:
             known_samples = {r.sample for r in lab_records}
             q_low = question.lower()
@@ -202,9 +233,9 @@ def api_chat():
                 if warnings:
                     return jsonify({"response": "\n".join(warnings)})
     except Exception:
-        pass  # if structured path fails, fall through to LLM
+        pass  # fall through to LLM
 
-    # ── Route 2: LLM fallback for generic / non-sample questions ─────────────
+    # ── Route 2: LLM fallback ─────────────────────────────────────────────────
     if not GOOGLE_API_KEY:
         return jsonify({"error": "Google API key not configured on the server."}), 500
 
@@ -215,7 +246,7 @@ def api_chat():
         except Exception as e:
             err = str(e)
             if "429" in err or "RESOURCE_EXHAUSTED" in err:
-                continue   # try next model
+                continue
             return jsonify({"error": err}), 500
 
     return jsonify({

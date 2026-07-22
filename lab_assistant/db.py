@@ -1,47 +1,63 @@
 """
-db.py — SQLite database schema, CRUD helpers, and 7-day auto-cleanup.
+db.py — PostgreSQL (Supabase) database schema, CRUD helpers, and 7-day auto-cleanup.
+
+Replaces the previous SQLite implementation. All data now lives in Supabase
+PostgreSQL, so it survives Render's ephemeral file system restarts.
 """
-import sqlite3
 import uuid
-from pathlib import Path
+import os
 from datetime import datetime, timedelta
 
-DB_PATH = Path(__file__).resolve().parent.parent / "data" / "lab_results.db"
+import psycopg2
+import psycopg2.extras
+from dotenv import load_dotenv
+from supabase import create_client, Client
+
+load_dotenv()
+
+DATABASE_URL   = os.getenv("DATABASE_URL", "")
+SUPABASE_URL   = os.getenv("SUPABASE_URL", "")
+SUPABASE_KEY   = os.getenv("SUPABASE_KEY", "")
+STORAGE_BUCKET = "lab-reports"
+
+# Keep DB_PATH as a dummy for backward compat with chat.py's SQL agent
+DB_PATH = "lab_results_pg"
 
 
-def get_conn() -> sqlite3.Connection:
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA foreign_keys=ON")
+def get_conn() -> psycopg2.extensions.connection:
+    conn = psycopg2.connect(DATABASE_URL)
+    conn.autocommit = False
     return conn
 
 
+def get_supabase() -> Client:
+    return create_client(SUPABASE_URL, SUPABASE_KEY)
+
+
 def init_db():
-    """Create tables if they don't exist."""
+    """Create tables if they don't exist (PostgreSQL syntax)."""
     conn = get_conn()
-    conn.executescript("""
+    cur = conn.cursor()
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS reports (
-            report_id        TEXT PRIMARY KEY,
-            upload_date      TEXT NOT NULL,
-            report_date      TEXT NOT NULL,
-            shift            TEXT NOT NULL,
-            uploaded_by      TEXT,
+            report_id          TEXT PRIMARY KEY,
+            upload_date        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            report_date        TEXT NOT NULL,
+            shift              TEXT NOT NULL,
+            uploaded_by        TEXT,
             original_file_name TEXT,
-            file_path        TEXT,
-            expires_at       TEXT NOT NULL
+            storage_path       TEXT,
+            expires_at         TIMESTAMPTZ NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS lab_results (
-            result_id        INTEGER PRIMARY KEY AUTOINCREMENT,
-            report_id        TEXT    NOT NULL,
+            result_id        SERIAL PRIMARY KEY,
+            report_id        TEXT    NOT NULL REFERENCES reports(report_id) ON DELETE CASCADE,
             report_date      TEXT    NOT NULL,
             shift            TEXT    NOT NULL,
             sample_name      TEXT,
             parameter_name   TEXT    NOT NULL,
-            parameter_value  TEXT    NOT NULL,
-            FOREIGN KEY (report_id) REFERENCES reports(report_id) ON DELETE CASCADE
+            parameter_value  TEXT    NOT NULL
         );
 
         CREATE INDEX IF NOT EXISTS idx_lr_report    ON lab_results(report_id);
@@ -50,76 +66,88 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_r_date_shift ON lab_results(report_date, shift);
     """)
     conn.commit()
+    cur.close()
     conn.close()
 
 
 # ── CRUD ──────────────────────────────────────────────────────────────────────
 
 def insert_report(report_date: str, shift: str, uploaded_by: str,
-                  original_file_name: str, file_path: str) -> str:
+                  original_file_name: str, file_path: str,
+                  storage_path: str = "") -> str:
     """Insert a report row. Returns the new report_id."""
-    now = datetime.now()
-    report_id = str(uuid.uuid4())
+    now        = datetime.now()
+    report_id  = str(uuid.uuid4())
     expires_at = (now + timedelta(days=7)).isoformat()
     conn = get_conn()
-    conn.execute(
+    cur  = conn.cursor()
+    cur.execute(
         """INSERT INTO reports
            (report_id, upload_date, report_date, shift, uploaded_by,
-            original_file_name, file_path, expires_at)
-           VALUES (?,?,?,?,?,?,?,?)""",
+            original_file_name, storage_path, expires_at)
+           VALUES (%s,%s,%s,%s,%s,%s,%s,%s)""",
         (report_id, now.isoformat(), report_date, shift, uploaded_by,
-         original_file_name, str(file_path), expires_at)
+         original_file_name, storage_path, expires_at)
     )
     conn.commit()
+    cur.close()
     conn.close()
     return report_id
 
 
 def insert_lab_results(report_id: str, rows: list[dict]):
-    """
-    Bulk-insert parsed lab result rows.
-    Each row: {report_date, shift, sample_name, parameter_name, parameter_value}
-    Blank values must be filtered BEFORE calling this.
-    """
+    """Bulk-insert parsed lab result rows."""
     if not rows:
         return
     conn = get_conn()
-    conn.executemany(
-        """INSERT INTO lab_results 
+    cur  = conn.cursor()
+    psycopg2.extras.execute_batch(
+        cur,
+        """INSERT INTO lab_results
            (report_id, report_date, shift, sample_name, parameter_name, parameter_value)
-           VALUES (:report_id, :report_date, :shift, :sample_name, :parameter_name, :parameter_value)""",
+           VALUES (%(report_id)s, %(report_date)s, %(shift)s,
+                   %(sample_name)s, %(parameter_name)s, %(parameter_value)s)""",
         [{"report_id": report_id, **r} for r in rows]
     )
     conn.commit()
+    cur.close()
     conn.close()
 
 
 def get_all_reports() -> list[dict]:
     conn = get_conn()
-    rows = conn.execute("""
+    cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("""
         SELECT r.*,
                COUNT(lr.result_id) AS result_count
         FROM   reports r
         LEFT JOIN lab_results lr ON r.report_id = lr.report_id
         GROUP  BY r.report_id
         ORDER  BY r.upload_date DESC
-    """).fetchall()
+    """)
+    rows = cur.fetchall()
+    cur.close()
     conn.close()
     return [dict(r) for r in rows]
 
 
 def delete_report(report_id: str):
-    """Delete a report and its lab data + the physical file."""
+    """Delete a report, its lab data, and the file from Supabase Storage."""
     conn = get_conn()
-    row = conn.execute(
-        "SELECT file_path FROM reports WHERE report_id=?", (report_id,)
-    ).fetchone()
-    if row and row["file_path"]:
-        fp = Path(row["file_path"])
-        if fp.exists():
-            fp.unlink()
-    conn.execute("DELETE FROM reports WHERE report_id=?", (report_id,))
+    cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    row = cur.execute(
+        "SELECT storage_path FROM reports WHERE report_id=%s", (report_id,)
+    )
+    row = cur.fetchone()
+    if row and row.get("storage_path"):
+        try:
+            sb = get_supabase()
+            sb.storage.from_(STORAGE_BUCKET).remove([row["storage_path"]])
+        except Exception:
+            pass
+    cur.execute("DELETE FROM reports WHERE report_id=%s", (report_id,))
     conn.commit()
+    cur.close()
     conn.close()
 
 
@@ -127,11 +155,9 @@ def query_results(report_date: str | None = None,
                   shift: str | None = None,
                   sample_filter: str | None = None,
                   parameter_filter: str | None = None) -> list[dict]:
-    """
-    Flexible query function used by the chatbot.
-    Returns non-empty parameter records only (they are always non-empty by design).
-    """
+    """Flexible query function used by the chatbot."""
     conn = get_conn()
+    cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     sql = """
         SELECT lr.report_date, lr.shift, lr.sample_name,
                lr.parameter_name, lr.parameter_value
@@ -140,20 +166,22 @@ def query_results(report_date: str | None = None,
     """
     params: list = []
     if report_date:
-        sql += " AND lr.report_date = ?"
+        sql += " AND lr.report_date = %s"
         params.append(report_date)
     if shift:
-        sql += " AND UPPER(lr.shift) = ?"
+        sql += " AND UPPER(lr.shift) = %s"
         params.append(shift.upper())
     if sample_filter:
-        sql += " AND LOWER(lr.sample_name) LIKE ?"
+        sql += " AND LOWER(lr.sample_name) LIKE %s"
         params.append(f"%{sample_filter.lower()}%")
     if parameter_filter:
-        sql += " AND LOWER(lr.parameter_name) LIKE ?"
+        sql += " AND LOWER(lr.parameter_name) LIKE %s"
         params.append(f"%{parameter_filter.lower()}%")
     sql += " ORDER BY lr.report_date DESC, lr.shift, lr.sample_name, lr.parameter_name"
 
-    rows = conn.execute(sql, params).fetchall()
+    cur.execute(sql, params)
+    rows = cur.fetchall()
+    cur.close()
     conn.close()
     return [dict(r) for r in rows]
 
@@ -161,19 +189,25 @@ def query_results(report_date: str | None = None,
 # ── 7-day automatic cleanup ───────────────────────────────────────────────────
 
 def run_cleanup() -> int:
-    """Delete all reports older than 7 days. Returns count deleted."""
-    now = datetime.now().isoformat()
+    """Delete all reports older than 7 days from DB and Supabase Storage."""
+    now  = datetime.now().isoformat()
     conn = get_conn()
-    expired = conn.execute(
-        "SELECT report_id, file_path FROM reports WHERE expires_at < ?", (now,)
-    ).fetchall()
+    cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute(
+        "SELECT report_id, storage_path FROM reports WHERE expires_at < %s", (now,)
+    )
+    expired = cur.fetchall()
 
+    sb = get_supabase() if expired else None
     for row in expired:
-        fp = Path(row["file_path"]) if row["file_path"] else None
-        if fp and fp.exists():
-            fp.unlink()
-        conn.execute("DELETE FROM reports WHERE report_id=?", (row["report_id"],))
+        if row.get("storage_path"):
+            try:
+                sb.storage.from_(STORAGE_BUCKET).remove([row["storage_path"]])
+            except Exception:
+                pass
+        cur.execute("DELETE FROM reports WHERE report_id=%s", (row["report_id"],))
 
     conn.commit()
+    cur.close()
     conn.close()
     return len(expired)

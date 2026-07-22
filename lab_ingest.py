@@ -1,47 +1,43 @@
 """
 lab_ingest.py
 =============
-Loads one or more PX/PTA lab-report .htm files into a SQLite table
-(`lab_results`), so the chatbot can answer structured lab queries without
-re-parsing HTML on every request.
+Loads PX/PTA lab-report .htm files into PostgreSQL (Supabase) and uploads
+the physical file to Supabase Storage for 7-day persistent retention.
 
-Schema (table: lab_results)
-----------------------------
-    id          INTEGER PRIMARY KEY
-    material    TEXT   -- e.g. "PNPX1 ( PX-1 )"
-    sample      TEXT   -- e.g. "Benzene Product"
-    date        TEXT   -- dd.mm.yyyy, as printed in the report
-    shift       TEXT   -- 'M' | 'E' | 'N'
-    parameter   TEXT   -- e.g. "BZ", "Unk", "C9A"
-    unit        TEXT   -- e.g. "WT%", "PPM" (may be blank)
-    value       TEXT   -- kept as text (values are already formatted strings
-                           in the source report, e.g. "0.00", "100.00")
-    source_file TEXT
-
-This is intentionally a separate table/pipeline from the PDF-based
-`documents`/ChromaDB pipeline in the main RAG project (see integration
-notes at the bottom of this file and in ANTIGRAVITY_INTEGRATION.md) -
-lab data is structured and needs exact lookups, not semantic search.
+This replaces the previous SQLite + local filesystem implementation.
 """
 
 from __future__ import annotations
 
-import sqlite3
 import os
+import uuid
 from pathlib import Path
 from datetime import datetime, timedelta
 
+import psycopg2
+import psycopg2.extras
+from dotenv import load_dotenv
+from supabase import create_client, Client
+
 from lab_parser import LabRecord, parse_lab_reports
+
+load_dotenv()
+
+DATABASE_URL   = os.getenv("DATABASE_URL", "")
+SUPABASE_URL   = os.getenv("SUPABASE_URL", "")
+SUPABASE_KEY   = os.getenv("SUPABASE_KEY", "")
+STORAGE_BUCKET = "lab-reports"
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS structured_reports (
-    source_file TEXT PRIMARY KEY,
-    upload_date TEXT NOT NULL,
-    expires_at  TEXT NOT NULL
+    source_file  TEXT PRIMARY KEY,
+    upload_date  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    expires_at   TIMESTAMPTZ NOT NULL,
+    storage_path TEXT
 );
 
-CREATE TABLE IF NOT EXISTS lab_results (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+CREATE TABLE IF NOT EXISTS structured_lab_results (
+    id          SERIAL PRIMARY KEY,
     material    TEXT NOT NULL,
     sample      TEXT NOT NULL,
     date        TEXT NOT NULL,
@@ -49,100 +45,125 @@ CREATE TABLE IF NOT EXISTS lab_results (
     parameter   TEXT NOT NULL,
     unit        TEXT,
     value       TEXT NOT NULL,
-    source_file TEXT NOT NULL,
-    FOREIGN KEY (source_file) REFERENCES structured_reports(source_file) ON DELETE CASCADE
+    source_file TEXT NOT NULL REFERENCES structured_reports(source_file) ON DELETE CASCADE
 );
-CREATE INDEX IF NOT EXISTS idx_lab_sample ON lab_results(sample);
-CREATE INDEX IF NOT EXISTS idx_lab_date ON lab_results(date);
-CREATE INDEX IF NOT EXISTS idx_lab_shift ON lab_results(shift);
+
+CREATE INDEX IF NOT EXISTS idx_slab_sample ON structured_lab_results(sample);
+CREATE INDEX IF NOT EXISTS idx_slab_date   ON structured_lab_results(date);
+CREATE INDEX IF NOT EXISTS idx_slab_shift  ON structured_lab_results(shift);
 """
 
 
-def init_lab_table(db_path: str | Path) -> None:
-    conn = sqlite3.connect(str(db_path))
-    try:
-        conn.execute("PRAGMA foreign_keys=ON")
-        conn.executescript(SCHEMA_SQL)
-        conn.commit()
-    finally:
-        conn.close()
+def _get_conn() -> psycopg2.extensions.connection:
+    conn = psycopg2.connect(DATABASE_URL)
+    conn.autocommit = False
+    return conn
 
 
-def cleanup_structured_reports(db_path: str | Path, uploads_dir: Path | None = None) -> int:
-    """Deletes structured reports older than 7 days from the DB and filesystem."""
-    init_lab_table(db_path)
-    now = datetime.now().isoformat()
-    conn = sqlite3.connect(str(db_path))
-    conn.execute("PRAGMA foreign_keys=ON")
-    conn.row_factory = sqlite3.Row
-    
-    try:
-        expired = conn.execute(
-            "SELECT source_file FROM structured_reports WHERE expires_at < ?", (now,)
-        ).fetchall()
-        
-        for row in expired:
-            source_file = row["source_file"]
-            # Delete physical file if uploads_dir provided
-            if uploads_dir:
-                fp = uploads_dir / source_file
-                if fp.exists():
-                    fp.unlink()
-            
-            # Delete from DB (will CASCADE delete from lab_results)
-            conn.execute("DELETE FROM structured_reports WHERE source_file=?", (source_file,))
-        
-        conn.commit()
-        return len(expired)
-    finally:
-        conn.close()
+def _get_supabase() -> Client:
+    return create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
-def load_records_into_db(records: list[LabRecord], db_path: str | Path) -> int:
-    """Insert parsed LabRecords into the lab_results table (long format:
-    one row per parameter per sample/date/shift). Returns the number of
-    parameter rows inserted.
-    """
-    init_lab_table(db_path)
-    conn = sqlite3.connect(str(db_path))
-    conn.execute("PRAGMA foreign_keys=ON")
-    count = 0
-    now = datetime.now()
+def init_lab_table(db_path=None) -> None:
+    """db_path kept for backward-compat signature; ignored (uses DATABASE_URL)."""
+    conn = _get_conn()
+    cur  = conn.cursor()
+    cur.execute(SCHEMA_SQL)
+    conn.commit()
+    cur.close()
+    conn.close()
+
+
+def cleanup_structured_reports(db_path=None, uploads_dir=None) -> int:
+    """Delete structured reports older than 7 days from DB and Supabase Storage."""
+    now  = datetime.now().isoformat()
+    conn = _get_conn()
+    cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute(
+        "SELECT source_file, storage_path FROM structured_reports WHERE expires_at < %s",
+        (now,)
+    )
+    expired = cur.fetchall()
+
+    sb = _get_supabase() if expired else None
+    for row in expired:
+        sp = row.get("storage_path")
+        if sp:
+            try:
+                sb.storage.from_(STORAGE_BUCKET).remove([sp])
+            except Exception:
+                pass
+        cur.execute(
+            "DELETE FROM structured_reports WHERE source_file=%s",
+            (row["source_file"],)
+        )
+
+    conn.commit()
+    cur.close()
+    conn.close()
+    return len(expired)
+
+
+def load_records_into_db(records: list[LabRecord], db_path=None,
+                         file_bytes: bytes | None = None,
+                         source_filename: str = "") -> int:
+    """Insert parsed LabRecords into PostgreSQL. Optionally upload raw bytes to Supabase Storage."""
+    conn = _get_conn()
+    cur  = conn.cursor()
+    now        = datetime.now()
     expires_at = (now + timedelta(days=7)).isoformat()
-    
-    try:
-        # First ensure all source_files are tracked in structured_reports
-        unique_files = {r.source_file for r in records}
-        for sf in unique_files:
-            conn.execute(
-                "INSERT OR IGNORE INTO structured_reports (source_file, upload_date, expires_at) "
-                "VALUES (?, ?, ?)",
-                (sf, now.isoformat(), expires_at)
-            )
 
-        # Then insert the actual records
-        for r in records:
-            for param, (unit, value) in r.values.items():
-                conn.execute(
-                    "INSERT INTO lab_results "
-                    "(material, sample, date, shift, parameter, unit, value, source_file) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                    (r.material, r.sample, r.date, r.shift, param, unit, value, r.source_file),
+    unique_files = {r.source_file for r in records}
+    sb = _get_supabase()
+
+    for sf in unique_files:
+        storage_path = ""
+        # Upload the physical .htm file to Supabase Storage
+        if file_bytes:
+            storage_path = f"{sf}"
+            try:
+                sb.storage.from_(STORAGE_BUCKET).upload(
+                    path=storage_path,
+                    file=file_bytes,
+                    file_options={"content-type": "text/html", "upsert": "true"},
                 )
-                count += 1
-        conn.commit()
-    finally:
-        conn.close()
+            except Exception as e:
+                print(f"[warn] Supabase Storage upload failed: {e}")
+
+        cur.execute(
+            """INSERT INTO structured_reports (source_file, upload_date, expires_at, storage_path)
+               VALUES (%s, %s, %s, %s)
+               ON CONFLICT (source_file) DO UPDATE
+               SET upload_date=%s, expires_at=%s, storage_path=%s""",
+            (sf, now.isoformat(), expires_at, storage_path,
+             now.isoformat(), expires_at, storage_path)
+        )
+
+    count = 0
+    for r in records:
+        psycopg2.extras.execute_batch(
+            cur,
+            """INSERT INTO structured_lab_results
+               (material, sample, date, shift, parameter, unit, value, source_file)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s)""",
+            [(r.material, r.sample, r.date, r.shift, param, unit, value, r.source_file)
+             for param, (unit, value) in r.values.items()]
+        )
+        count += len(r.values)
+
+    conn.commit()
+    cur.close()
+    conn.close()
     return count
 
 
-def ingest_lab_reports(filepaths: list[str | Path], db_path: str | Path) -> dict:
-    """End-to-end: parse HTML lab report(s) and load them into SQLite.
-
-    Returns a small summary dict useful for a Streamlit status message.
-    """
-    records = parse_lab_reports(filepaths)
-    inserted = load_records_into_db(records, db_path)
+def ingest_lab_reports(filepaths: list, db_path=None,
+                       file_bytes: bytes | None = None) -> dict:
+    """End-to-end: parse HTML lab report(s) and load into PostgreSQL + Supabase Storage."""
+    records  = parse_lab_reports(filepaths)
+    source_filename = str(Path(filepaths[0]).name) if filepaths else ""
+    inserted = load_records_into_db(records, file_bytes=file_bytes,
+                                    source_filename=source_filename)
     return {
         "files": [str(f) for f in filepaths],
         "num_rows_parsed": len(records),
@@ -153,20 +174,16 @@ def ingest_lab_reports(filepaths: list[str | Path], db_path: str | Path) -> dict
     }
 
 
-def load_records_from_db(db_path: str | Path) -> list[LabRecord]:
-    """Reconstruct LabRecord objects from the SQLite table (long format ->
-    grouped back into one record per material/sample/date/shift), so
-    lab_query.py can operate on them the same way whether they came
-    straight from parsing or were reloaded from storage.
-    """
-    conn = sqlite3.connect(str(db_path))
-    conn.row_factory = sqlite3.Row
-    try:
-        rows = conn.execute(
-            "SELECT * FROM lab_results ORDER BY material, sample, date, shift"
-        ).fetchall()
-    finally:
-        conn.close()
+def load_records_from_db(db_path=None) -> list[LabRecord]:
+    """Load all LabRecords from PostgreSQL, reconstructed from long-format rows."""
+    conn = _get_conn()
+    cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute(
+        "SELECT * FROM structured_lab_results ORDER BY material, sample, date, shift"
+    )
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
 
     grouped: dict[tuple, LabRecord] = {}
     for row in rows:
@@ -183,3 +200,24 @@ def load_records_from_db(db_path: str | Path) -> list[LabRecord]:
         grouped[key].values[row["parameter"]] = (row["unit"] or "", row["value"])
 
     return list(grouped.values())
+
+
+def get_all_structured_reports() -> list[dict]:
+    """Return all stored structured reports with expiry info for the UI."""
+    conn = _get_conn()
+    cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("""
+        SELECT sr.source_file, sr.upload_date, sr.expires_at,
+               COUNT(slr.id) AS record_count,
+               MIN(slr.date) AS earliest_date,
+               MAX(slr.date) AS latest_date,
+               STRING_AGG(DISTINCT slr.shift, '/') AS shifts
+        FROM   structured_reports sr
+        LEFT JOIN structured_lab_results slr ON sr.source_file = slr.source_file
+        GROUP  BY sr.source_file, sr.upload_date, sr.expires_at
+        ORDER  BY sr.upload_date DESC
+    """)
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return [dict(r) for r in rows]

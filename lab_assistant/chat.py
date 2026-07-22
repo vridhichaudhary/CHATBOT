@@ -173,15 +173,17 @@ def _format_results(rows: list[dict]) -> str:
 
 def _llm_answer(question: str, api_key: str, model: str) -> str:
     """Use LangChain SQL Agent for complex / ambiguous queries."""
+    import os
     from datetime import date as _date
     from langchain_google_genai import ChatGoogleGenerativeAI
     from langchain_community.utilities import SQLDatabase
     from langchain_community.agent_toolkits import create_sql_agent
 
     today_str = _date.today().isoformat()
+    db_url    = os.getenv("DATABASE_URL", "")
 
     llm = ChatGoogleGenerativeAI(model=model, google_api_key=api_key, temperature=0)
-    db  = SQLDatabase.from_uri(f"sqlite:///{DB_PATH}")
+    db  = SQLDatabase.from_uri(db_url)
 
     PREFIX = (
         f"Today's date is {today_str}. "
