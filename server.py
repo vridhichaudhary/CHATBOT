@@ -220,24 +220,31 @@ def api_chat():
     if not question:
         return jsonify({"error": "No question provided"}), 400
 
-    # ── Route 1: Structured lab_query (zero LLM, exact precision) ────────────
+    # ── Route 1: Structured lab_query (fuzzy, zero LLM tokens) ───────────────
+    # Always try the structured path first — it uses tokenized fuzzy matching
+    # so informal queries like "pta 7 july" or "601 btm" are handled correctly
+    # WITHOUT requiring the full sample name to appear as an exact substring.
     try:
         lab_records = load_records_from_db()
         if lab_records:
-            known_samples = {r.sample for r in lab_records}
-            q_low = question.lower()
-            if any(s.lower() in q_low for s in known_samples):
-                results, parsed, warnings = query_records(question, lab_records)
-                if results:
-                    return jsonify({"response": format_records_as_tables(results)})
-                if warnings:
-                    return jsonify({"response": "\n".join(warnings)})
-    except Exception:
-        pass  # fall through to LLM
+            results, parsed, warnings = query_records(question, lab_records)
+            if results:
+                return jsonify({"response": format_records_as_tables(results)})
+            # A sample was found in the hint but no matching rows for date/shift
+            if warnings and parsed.sample_hint:
+                return jsonify({"response": "\n".join(warnings)})
+            # Structured path found nothing — fall through to LLM for general Qs
+    except Exception as exc:
+        print(f"[warn] Structured query error: {exc}")
 
-    # ── Route 2: LLM fallback ─────────────────────────────────────────────────
+    # ── Route 2: LLM fallback for non-lab / general questions ────────────────
     if not GOOGLE_API_KEY:
-        return jsonify({"error": "Google API key not configured on the server."}), 500
+        return jsonify({
+            "response": (
+                "I couldn't find any lab records matching your query. "
+                "Please upload a lab report first, or rephrase your sample name."
+            )
+        })
 
     for model in MODEL_WATERFALL:
         try:
