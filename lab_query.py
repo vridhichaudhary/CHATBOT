@@ -6,15 +6,16 @@ lab_parser.py). Answers questions like:
 
     "Benzene Product 7 July M"
     "DSN 5 July"                (no shift -> all shifts returned)
-    "PX-1 Reformate night"
     "pta"                       (returns ALL PTA samples across all hours)
     "601"                       (matches C-601 Btm AND C-601 Reflux)
     "601 btm"                   (narrows to C-601 Btm exactly)
     "dec7 oh"                   (matches DeC7 O/H via synonym)
-
-by resolving the sample name, date, and (optional) shift from the query
-text, then returning every reported parameter for the matching row(s) as a
-clean table: parameter | unit | value.
+    "tatory overhead"           (matches Tatory Str.O/H)
+    "cta 5"                     (matches CTA 05:00 Hrs)
+    "extract bottom"            (matches Extract Bottom)
+    "finishing col oh"          (matches Finish.Col.O/H)
+    "bt overhead"               (matches BT OH ...)
+    "stripper col receiver"     (matches Str.Col.Receiver)
 
 Shift codes: M = Morning, E = Evening, N = Night.
 """
@@ -111,67 +112,135 @@ def parse_query(query: str) -> ParsedQuery:
     return ParsedQuery(sample_hint, day, month, year, shift, query)
 
 
-# Synonym groups for common refinery-jargon abbreviations, so a query using
-# any variant of a word matches sample names using any other variant.
-# Add new groups here as new abbreviation patterns are discovered - do not
+# ── Synonym table ──────────────────────────────────────────────────────────────
+# Maps any informal/abbreviated word → its canonical token.
+# The SAME canonical token is produced from the full word and all its short
+# forms, so sample names and user queries normalize to identical token sets.
+#
+# Covers abbreviations found across the PX + PTA plant lab reports:
+#   C-601 Btm, Tatory Str.O/H, Finish.Col.O/H, DeC7-Bottom, NHT Str Rec Boot,
+#   CTA 05:00 Hrs, BT OH 05:00 hr, Extract(SSU) R/D, PSA Feed Gas, etc.
+#
+# Add new rows here when a new abbreviation pattern is discovered - do NOT
 # scatter ad-hoc string replacements elsewhere in this module.
-_SAMPLE_SYNONYMS = {
-    "btm": "bottom", "bot": "bottom", "bott": "bottom", "bottom": "bottom",
-    "oh": "oh", "ovhd": "oh", "ovhead": "oh", "overhead": "oh",
-    "reflx": "reflux", "reflux": "reflux",
-    "recv": "receiver", "receive": "receiver", "receiver": "receiver",
+_SAMPLE_SYNONYMS: dict[str, str] = {
+    # ── Bottom / Top / Overhead ──────────────────────────────────────────────
+    "btm":      "bottom",   "bot":     "bottom",
+    "bott":     "bottom",   "bottom":  "bottom",
+    "btop":     "top",      "top":     "top",
+    "oh":       "oh",       "ovhd":    "oh",
+    "ovhead":   "oh",       "overhead":"oh",
+    "o":        "oh",       # 'o' alone after 'h' split → kept as-is by normalizer
+
+    # ── Feed / Product / Reflux ──────────────────────────────────────────────
+    "fd":       "feed",     "feed":    "feed",
+    "prod":     "product",  "prd":     "product",  "product":  "product",
+    "reflx":    "reflux",   "refl":    "reflux",   "reflux":   "reflux",
+
+    # ── Receiver / Separator / Boot ──────────────────────────────────────────
+    "recv":     "receiver", "rcvr":    "receiver", "receiver": "receiver",
+    "rec":      "receiver",   # 'rec' as abbreviation for 'receiver'
+    "sep":      "sep",      "separator":"sep",
+    "boot":     "boot",     "bt":      "bt",       # BT = equipment name, keep
+
+    # ── Column / Stripper / Finisher ─────────────────────────────────────────
+    "col":      "col",      "column":  "col",      "clmn":     "col",
+    "str":      "str",      "stripper":"str",      "strip":    "str",
+    "fin":      "fin",      "finish":  "fin",      "finishing":"fin",
+
+    # ── Aromatic / Raffinate / Extract ───────────────────────────────────────
+    "aro":      "aro",      "aromatic":"aro",
+    "raff":     "raffinate","raffinate":"raffinate",
+    "ext":      "extract",  "extract": "extract",
+
+    # ── Liquid / Gas / Vent / Water ──────────────────────────────────────────
+    "liq":      "liq",      "liquid":  "liq",
+    "gas":      "gas",      "gs":      "gas",
+    "vent":     "vent",     "vnt":     "vent",
+    "water":    "water",    "wtr":     "water",
+
+    # ── Tatory (Tatarsky distillation column) ────────────────────────────────
+    "tat":      "tatory",   "tatory":  "tatory",
+
+    # ── Centrifuge / Tank / Reactor ──────────────────────────────────────────
+    "cen":      "cen",      "centrifuge":"cen",
+    "tk":       "tk",       "tank":    "tk",
+    "rct":      "rct",      "reactor": "rct",
+
+    # ── Heavy / Slurry / Solution ─────────────────────────────────────────────
+    "hvy":      "heavy",    "heavy":   "heavy",
+    "slry":     "slurry",   "slurry":  "slurry",
+    "solut":    "solution", "soln":    "solution", "sol":  "solution",
+    "solution": "solution",
+
+    # ── Boiler / Make up ─────────────────────────────────────────────────────
+    "blr":      "boiler",   "boiler":  "boiler",
+    "mkup":     "makeup",   "makeup":  "makeup",
+
+    # ── Hours (time-slot samples like "CTA 07:30 Hrs", "PTA 03:30 Hrs") ─────
+    "hrs":      "hrs",      "hr":      "hrs",      "hour": "hrs",
+
+    # ── De-Cx columns (DeC4, DeC7) ───────────────────────────────────────────
+    # These are handled by the letter/digit boundary splitter (dec4 → dec, 4)
+    # plus prefix token matching, so no explicit synonym needed.
 }
 
-# Matches "O/H", "o / h", "O /H" etc. so it can be canonicalized to the
-# single token "oh" - the same token that a user typing "oh" produces -
-# BEFORE generic punctuation stripping would otherwise split it into two
-# separate single-letter tokens ("o", "h") that could spuriously match
-# all sorts of unrelated samples.
+# Matches "O/H", "o / h", "O /H" etc. → canonical "oh" BEFORE generic
+# punctuation stripping shreds it into two useless single-letter tokens.
 _OH_SLASH_PATTERN = re.compile(r"\bo\s*/\s*h\b", re.IGNORECASE)
+
+# Matches "R/D" (Raffinate/Distillate), "r / d" → "rd"
+_RD_SLASH_PATTERN = re.compile(r"\br\s*/\s*d\b", re.IGNORECASE)
 
 
 def _normalize_to_tokens(text: str) -> set[str]:
-    """Normalize a sample name or a user's free-text hint into a
-    comparable set of tokens, so that punctuation (-, /, ., (), :),
-    casing, and known abbreviations never prevent a match.
+    """Normalize a sample name or free-text hint into a comparable token set.
+
+    Steps:
+      1. Canonicalize special slash forms (O/H → oh, R/D → rd).
+      2. Lowercase, replace all non-alphanumeric runs with spaces.
+      3. Split at letter/digit boundaries (c601 → c, 601).
+      4. Strip leading zeros from numeric tokens (05 → 5, 07 → 7)
+         so "cta 5" matches "CTA 05:00 Hrs".
+      5. Apply the synonym table.
+      6. Drop empty tokens.
 
     Examples:
-        "C-601 Btm"        -> {"c", "601", "bottom"}
-        "601"              -> {"601"}
-        "601 bottom"       -> {"601", "bottom"}
-        "DeC7 O/H"         -> {"dec7", "oh"}
-        "oh"               -> {"oh"}
-        "PTA  07:30 Hrs"   -> {"pta", "07", "30", "hrs"}
+        "C-601 Btm"        → {"c", "601", "bottom"}
+        "601 btm"          → {"601", "bottom"}
+        "DeC7 O/H"         → {"dec", "7", "oh"}
+        "Finish.Col.O/H"   → {"fin", "col", "oh"}
+        "Tatory Str.O/H"   → {"tatory", "str", "oh"}
+        "CTA 05:00 Hrs"    → {"cta", "5", "0", "hrs"}
+        "cta 5"            → {"cta", "5"}
+        "NHT Str Rec Boot" → {"nht", "str", "receiver", "boot"}
+        "nht stripper receiver boot" → {"nht", "str", "receiver", "boot"}
     """
     text = _OH_SLASH_PATTERN.sub("oh", text.lower())
+    text = _RD_SLASH_PATTERN.sub("rd", text)
     text = re.sub(r"[^a-z0-9]+", " ", text)
-    # Split letter/digit boundaries so a concatenated form like "c601"
-    # tokenizes identically to the separated "C-601" (-> "c", "601"),
-    # rather than becoming one unmatched compound token.
+    # Split letter/digit boundaries: c601 → c 601, dec7 → dec 7
     text = re.sub(r"(?<=[a-z])(?=[0-9])", " ", text)
     text = re.sub(r"(?<=[0-9])(?=[a-z])", " ", text)
-    tokens = (_SAMPLE_SYNONYMS.get(tok, tok) for tok in text.split())
-    return {tok for tok in tokens if tok}
+
+    result: set[str] = set()
+    for tok in text.split():
+        # Strip leading zeros from numeric tokens so "05" and "5" match
+        if tok.isdigit():
+            tok = tok.lstrip("0") or "0"
+        tok = _SAMPLE_SYNONYMS.get(tok, tok)
+        if tok:
+            result.add(tok)
+    return result
 
 
 def _best_sample_match(sample_hint: str | None, known_samples: list[str]) -> list[str]:
     """Return the known sample name(s) matching the free-text hint.
 
-    Uses tokenized, punctuation- and abbreviation-insensitive matching so
-    informal queries work naturally:
-      - Separators (-, /, ., (), :) never block a match: "601" matches
-        "C-601 Btm".
-      - A single word from a multi-word sample name is enough: "pta"
-        matches every "PTA <time> Hrs" sample (all of them are returned,
-        by design).
-      - Known abbreviation variants are treated as identical: "btm" /
-        "bott" / "bottom" all match each other; "oh" matches "O/H".
-
-    Three tiers, most precise first:
+    Three tiers:
       1. Exact token-set equality.
-      2. Hint tokens fully contained within a sample's tokens (all
-         qualifying samples returned, not narrowed to one).
-      3. Best-effort partial token overlap for typos / partial hints.
+      2. Hint tokens ⊆ sample tokens — all qualifying samples returned.
+      3. Best-effort partial overlap fallback.
     """
     if not sample_hint:
         return []
@@ -181,17 +250,17 @@ def _best_sample_match(sample_hint: str | None, known_samples: list[str]) -> lis
 
     sample_tokens = {s: _normalize_to_tokens(s) for s in known_samples}
 
-    # Tier 1: exact token-set equality.
+    # Tier 1: exact
     exact = [s for s, toks in sample_tokens.items() if toks == hint_tokens]
     if exact:
         return sorted(exact)
 
-    # Tier 2: hint tokens are a subset of the sample's tokens.
+    # Tier 2: hint is a subset
     contains = [s for s, toks in sample_tokens.items() if hint_tokens <= toks]
     if contains:
         return sorted(contains)
 
-    # Tier 3: partial overlap fallback.
+    # Tier 3: partial overlap
     scored = [
         (len(hint_tokens & toks), s)
         for s, toks in sample_tokens.items()
@@ -207,7 +276,7 @@ def _best_sample_match(sample_hint: str | None, known_samples: list[str]) -> lis
 
 def _date_matches(record_date: str, day: int | None, month: int | None, year: int | None) -> bool:
     if day is None or month is None:
-        return True  # no date filter -> match all dates
+        return True
     try:
         d_part, m_part, y_part = record_date.split(".")
         rd, rm, ry = int(d_part), int(m_part), int(y_part)
@@ -223,10 +292,7 @@ def _date_matches(record_date: str, day: int | None, month: int | None, year: in
 def query_records(
     query: str, records: list[LabRecord]
 ) -> tuple[list[LabRecord], ParsedQuery, list[str]]:
-    """Resolve a natural-language query against parsed lab records.
-
-    Returns (matching_records, parsed_query, warnings).
-    """
+    """Resolve a natural-language query against parsed lab records."""
     parsed = parse_query(query)
     warnings: list[str] = []
 
